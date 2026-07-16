@@ -60,7 +60,7 @@ class _XGBDDPMMixin:
         objective = {"x": 0, "eps": 1, "v": 2}[self.ddpm_objective]
         refresh_every_k = int(self.refresh_every_k)
         seed = int(self.random_state or 0) + (10_000_000 if validation else 0)
-        if refresh_every_k >= 1:
+        if refresh_every_k >= 1 and not validation:
             seed += iteration // refresh_every_k
         config = make_jcargs(
             noise_samples_per_row=int(self.noise_samples_per_row),
@@ -149,8 +149,6 @@ class _XGBDDPMMixin:
             for i in range(self.get_num_boosting_rounds()):
                 if refresh_every_k >= 1 and i and i % refresh_every_k == 0:
                     self._refresh_dmatrix(dtrain, X_np, y_np, i)
-                    for (dm, _), (a, b) in zip(evals, eval_arrays):
-                        self._refresh_dmatrix(dm, a, b, i, validation=True)
                     _check_call(_LIB.XGBoosterClearCaches(bst.handle))
                 if cb.before_iteration(bst, i, dtrain, evals):
                     break
