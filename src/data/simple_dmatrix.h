@@ -73,6 +73,9 @@ class SimpleDMatrix : public DMatrix {
   bool EllpackExists() const override { return static_cast<bool>(ellpack_page_); }
   bool GHistIndexExists() const override { return static_cast<bool>(gradient_index_); }
   bool SparsePageExists() const override { return true; }
+  std::shared_ptr<GHistIndexMatrix> MakeXGBDDFastGHist();
+  void FinishXGBDDFastGHist(std::shared_ptr<GHistIndexMatrix> const& gidx,
+                            std::vector<std::size_t> const& hit_count_tloc);
 
   /**
    * @brief Reindex the features based on a global view.

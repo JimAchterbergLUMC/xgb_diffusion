@@ -1221,6 +1221,16 @@ XGB_DLL int XGBoosterClearCaches(BoosterHandle handle) {
   API_END();
 }
 
+XGB_DLL int XGBoosterClearDMatrixCache(BoosterHandle handle, DMatrixHandle dmat) {
+  API_BEGIN();
+  CHECK_HANDLE();
+  xgboost_CHECK_C_ARG_PTR(dmat);
+  auto *m = static_cast<std::shared_ptr<DMatrix> *>(dmat);
+  CHECK(m);
+  static_cast<Learner *>(handle)->ClearDMatrixCache(*m);
+  API_END();
+}
+
 XGB_DLL int XGBoosterBoostOneIter(BoosterHandle handle, DMatrixHandle dtrain, bst_float *grad,
                                   bst_float *hess, xgboost::bst_ulong len) {
   API_BEGIN();

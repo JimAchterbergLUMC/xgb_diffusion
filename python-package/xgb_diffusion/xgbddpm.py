@@ -149,7 +149,7 @@ class _XGBDDPMMixin:
             for i in range(self.get_num_boosting_rounds()):
                 if refresh_every_k >= 1 and i and i % refresh_every_k == 0:
                     self._refresh_dmatrix(dtrain, X_np, y_np, i)
-                    _check_call(_LIB.XGBoosterClearCaches(bst.handle))
+                    _check_call(_LIB.XGBoosterClearDMatrixCache(bst.handle, dtrain.handle))
                 if cb.before_iteration(bst, i, dtrain, evals):
                     break
                 bst.update(dtrain, iteration=i)

@@ -165,6 +165,11 @@ void GHistIndexMatrix::ResizeColumns(double sparse_thresh) {
   this->columns_ = std::make_unique<common::ColumnMatrix>(*this, sparse_thresh);
 }
 
+void GHistIndexMatrix::InitColumnMatrix(Context const* ctx, double sparse_thresh) {
+  this->ResizeColumns(sparse_thresh);
+  this->columns_->InitFromGHist(ctx, *this);
+}
+
 void GHistIndexMatrix::ResizeIndex(Context const *ctx, const size_t n_index, const bool isDense) {
   auto make_index = [this, ctx, n_index](auto t, common::BinTypeSize t_size) {
     // Must resize instead of allocating a new one. This function is called everytime a

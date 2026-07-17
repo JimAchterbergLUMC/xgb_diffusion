@@ -1124,6 +1124,15 @@ XGB_DLL int XGBoosterUpdateOneIter(BoosterHandle handle, int iter, DMatrixHandle
  * @return 0 when success, -1 when failure happens.
  */
 XGB_DLL int XGBoosterClearCaches(BoosterHandle handle);
+
+/**
+ * @brief Clear the prediction cache held by the Booster for one DMatrix.
+ *
+ * @param handle Booster handle.
+ * @param dmat DMatrix handle.
+ * @return 0 when success, -1 when failure happens.
+ */
+XGB_DLL int XGBoosterClearDMatrixCache(BoosterHandle handle, DMatrixHandle dmat);
 /**
  * @example c-api-demo.c
  */

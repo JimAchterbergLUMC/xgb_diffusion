@@ -894,6 +894,12 @@ class LearnerIO : public LearnerConfiguration {
 
   void ClearCaches() override { this->prediction_container_ = PredictionContainer{}; }
 
+  void ClearDMatrixCache(std::shared_ptr<DMatrix> data) override {
+    auto predt = this->prediction_container_.Cache(data, ctx_.Device());
+    predt->predictions = HostDeviceVector<float>{};
+    predt->Reset();
+  }
+
   void LoadModel(Json const& in) override {
     CHECK(IsA<Object>(in));
     auto version = Version::Load(in);

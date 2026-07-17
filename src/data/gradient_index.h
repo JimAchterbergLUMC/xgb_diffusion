@@ -233,6 +233,7 @@ class GHistIndexMatrix {
                                size_t rbegin);
 
   void ResizeIndex(Context const* ctx, const size_t n_index, const bool isDense);
+  void InitColumnMatrix(Context const* ctx, double sparse_thresh);
 
   void GetFeatureCounts(size_t* counts) const {
     auto nfeature = cut.Ptrs().size() - 1;

@@ -6,6 +6,8 @@
  */
 #include "simple_dmatrix.h"
 
+#include <dmlc/omp.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -50,6 +52,50 @@ MetaInfo& SimpleDMatrix::Info() { return info_; }
 
 const MetaInfo& SimpleDMatrix::Info() const { return info_; }
 
+std::shared_ptr<GHistIndexMatrix> SimpleDMatrix::MakeXGBDDFastGHist() {
+  if (!xgbddpm_enabled_ || !xgbddpm_cuts_ || !batch_param_.Initialized() ||
+      !batch_param_.hess.empty() || std::isnan(batch_param_.sparse_thresh) ||
+      fmat_ctx_.IsCUDA()) {
+    return nullptr;
+  }
+
+  auto gidx = std::make_shared<GHistIndexMatrix>(
+      this->Info(), common::HistogramCuts{*xgbddpm_cuts_}, batch_param_.max_bin);
+  gidx->SetDense(true);
+
+  auto out_rows = this->Info().num_row_;
+  auto out_cols = this->Info().num_col_;
+  auto& row_ptr = gidx->row_ptr;
+  common::ParallelFor(out_rows + 1, fmat_ctx_.Threads(), [&](auto r) {
+    row_ptr[r] = static_cast<std::size_t>(r) * out_cols;
+  });
+
+  gidx->ResizeIndex(&fmat_ctx_, out_rows * out_cols, true);
+  gidx->index.SetBinOffset(gidx->cut.Ptrs());
+  return gidx;
+}
+
+void SimpleDMatrix::FinishXGBDDFastGHist(
+    std::shared_ptr<GHistIndexMatrix> const& gidx,
+    std::vector<std::size_t> const& hit_count_tloc) {
+  if (!gidx) {
+    gradient_index_.reset();
+    return;
+  }
+
+  auto n_bins = gidx->cut.TotalBins();
+  auto n_threads = fmat_ctx_.Threads();
+  common::ParallelFor(n_bins, n_threads, [&](auto bin) {
+    std::size_t count{0};
+    for (int32_t tid = 0; tid < n_threads; ++tid) {
+      count += hit_count_tloc[tid * n_bins + bin];
+    }
+    gidx->hit_count[bin] = count;
+  });
+  gidx->InitColumnMatrix(&fmat_ctx_, batch_param_.sparse_thresh);
+  gradient_index_ = gidx;
+}
+
 void SimpleDMatrix::XGBDDPMRefresh(ArrayInterface<2> const& x0, ArrayInterface<1> const& y0,
                                    ArrayInterface<1> const& alpha_bars,
                                    std::int32_t noise_samples_per_row, std::int32_t timestep,
@@ -72,6 +118,16 @@ void SimpleDMatrix::XGBDDPMRefresh(ArrayInterface<2> const& x0, ArrayInterface<1
   CHECK_EQ(this->Info().num_row_, out_rows);
   CHECK_EQ(this->Info().num_col_, out_cols);
 
+  if (gradient_index_) {
+    xgbddpm_cuts_ = std::make_shared<common::HistogramCuts>(gradient_index_->Cuts());
+  }
+  this->Info().num_nonzero_ = out_rows * out_cols;
+  auto fast_gidx = this->MakeXGBDDFastGHist();
+  std::vector<std::size_t> hit_count_tloc;
+  if (fast_gidx) {
+    hit_count_tloc.resize(fmat_ctx_.Threads() * fast_gidx->cut.TotalBins(), 0);
+  }
+
   auto const& ft = this->Info().feature_types.ConstHostVector();
   CHECK(ft.empty() || ft.size() == out_cols);
 
@@ -87,67 +143,104 @@ void SimpleDMatrix::XGBDDPMRefresh(ArrayInterface<2> const& x0, ArrayInterface<1
   auto& labels = this->Info().labels.Data()->HostVector();
   labels.resize(out_rows);
 
-  common::ParallelFor(out_rows, fmat_ctx_.Threads(), [&](auto out_r) {
-    auto t = all_steps ? out_r / rows_per_step : static_cast<std::size_t>(timestep);
-    auto step_r = all_steps ? out_r % rows_per_step : out_r;
-    auto base_r = step_r / static_cast<std::size_t>(noise_samples_per_row);
-    auto alpha_bar = alpha_bars(t);
-    auto alpha = std::sqrt(alpha_bar);
-    auto sigma = std::sqrt(1.0f - alpha_bar);
-    bst_float target_value{0};
-    std::size_t cat_pos{0};
+  auto refresh = [&](auto bin_type, auto build_gidx) {
+    using BinT = decltype(bin_type);
+    constexpr bool kBuildGHist = decltype(build_gidx)::value;
+    BinT* index_data = nullptr;
+    std::uint32_t const* offsets = nullptr;
+    auto const* ptrs = static_cast<std::vector<std::uint32_t> const*>(nullptr);
+    auto const* values = static_cast<std::vector<float> const*>(nullptr);
+    if constexpr (kBuildGHist) {
+      index_data = fast_gidx->index.data<BinT>();
+      offsets = fast_gidx->index.Offset();
+      ptrs = &fast_gidx->cut.Ptrs();
+      values = &fast_gidx->cut.Values();
+    }
 
-    for (std::size_t c = 0; c < n_cols; ++c) {
-      auto out_i = out_r * out_cols + c;
-      data[out_i].index = static_cast<bst_feature_t>(c);
+    common::ParallelFor(out_rows, fmat_ctx_.Threads(), [&](auto out_r) {
+      auto t = all_steps ? out_r / rows_per_step : static_cast<std::size_t>(timestep);
+      auto step_r = all_steps ? out_r % rows_per_step : out_r;
+      auto base_r = step_r / static_cast<std::size_t>(noise_samples_per_row);
+      auto alpha_bar = alpha_bars(t);
+      auto alpha = std::sqrt(alpha_bar);
+      auto sigma = std::sqrt(1.0f - alpha_bar);
+      bst_float target_value{0};
+      std::size_t cat_pos{0};
+      auto tid = omp_get_thread_num();
 
-      bool is_cat = !ft.empty() && ft[c] == FeatureType::kCategorical;
-      if (is_cat) {
-        CHECK_LT(cat_pos, n_classes.size());
-        auto keep = XGBDDPMUniform(seed ^ (out_r * 0xd1342543de82ef95ULL) ^
-                                   (c * 0x9e3779b97f4a7c15ULL)) < alpha_bar;
-        auto repl = static_cast<bst_float>(static_cast<std::int64_t>(
-            XGBDDPMUniform(seed ^ (out_r * 0x94d049bb133111ebULL) ^
-                           (c * 0xbf58476d1ce4e5b9ULL)) *
-            n_classes[cat_pos]));
-        data[out_i].fvalue = keep ? x0(base_r, c) : repl;
-        ++cat_pos;
+      for (std::size_t c = 0; c < n_cols; ++c) {
+        auto out_i = out_r * out_cols + c;
+        data[out_i].index = static_cast<bst_feature_t>(c);
+
+        bool is_cat = !ft.empty() && ft[c] == FeatureType::kCategorical;
+        if (is_cat) {
+          CHECK_LT(cat_pos, n_classes.size());
+          auto keep = XGBDDPMUniform(seed ^ (out_r * 0xd1342543de82ef95ULL) ^
+                                     (c * 0x9e3779b97f4a7c15ULL)) < alpha_bar;
+          auto repl = static_cast<bst_float>(static_cast<std::int64_t>(
+              XGBDDPMUniform(seed ^ (out_r * 0x94d049bb133111ebULL) ^
+                             (c * 0xbf58476d1ce4e5b9ULL)) *
+              n_classes[cat_pos]));
+          data[out_i].fvalue = keep ? x0(base_r, c) : repl;
+          ++cat_pos;
+        } else {
+          data[out_i].fvalue =
+              alpha * x0(base_r, c) + sigma * XGBDDPMNormal(seed, out_r, c);
+        }
+
+        if constexpr (kBuildGHist) {
+          auto fidx = static_cast<bst_feature_t>(c);
+          auto bin_idx = is_cat ? fast_gidx->cut.SearchCatBin(data[out_i].fvalue, fidx, *ptrs,
+                                                              *values)
+                                : fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs,
+                                                           *values);
+          index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
+          ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
+        }
+
+        if (c == target_index) {
+          target_value = data[out_i].fvalue;
+        }
+      }
+
+      if (all_steps) {
+        auto out_i = out_r * out_cols + n_cols;
+        auto fidx = static_cast<bst_feature_t>(n_cols);
+        data[out_i].index = fidx;
+        data[out_i].fvalue = static_cast<bst_float>(t);
+        if constexpr (kBuildGHist) {
+          auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
+          index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
+          ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
+        }
+      }
+
+      auto y = y0(base_r);
+      if (objective == 1 || objective == 2) {
+        auto sigma = std::max(std::sqrt(1.0f - alpha_bars(t)), 1e-6f);
+        auto alpha = std::sqrt(alpha_bars(t));
+        auto eps = (target_value - alpha * y) / sigma;
+        labels[out_r] = objective == 1 ? eps : alpha * eps - sigma * y;
       } else {
-        data[out_i].fvalue =
-            alpha * x0(base_r, c) + sigma * XGBDDPMNormal(seed, out_r, c);
+        labels[out_r] = y;
       }
+    });
+  };
 
-      if (c == target_index) {
-        target_value = data[out_i].fvalue;
-      }
-    }
-
-    if (all_steps) {
-      auto out_i = out_r * out_cols + n_cols;
-      data[out_i].index = static_cast<bst_feature_t>(n_cols);
-      data[out_i].fvalue = static_cast<bst_float>(t);
-    }
-
-    auto y = y0(base_r);
-    if (objective == 1 || objective == 2) {
-      auto sigma = std::max(std::sqrt(1.0f - alpha_bars(t)), 1e-6f);
-      auto alpha = std::sqrt(alpha_bars(t));
-      auto eps = (target_value - alpha * y) / sigma;
-      labels[out_r] = objective == 1 ? eps : alpha * eps - sigma * y;
-    } else {
-      labels[out_r] = y;
-    }
-  });
+  if (fast_gidx) {
+    common::DispatchBinType(fast_gidx->index.GetBinTypeSize(), [&](auto bin_type) {
+      refresh(bin_type, std::true_type{});
+    });
+  } else {
+    refresh(std::uint32_t{}, std::false_type{});
+  }
 
   this->Info().num_nonzero_ = data.size();
   column_page_.reset();
   sorted_column_page_.reset();
   ellpack_page_.reset();
-  if (gradient_index_) {
-    xgbddpm_cuts_ = std::make_shared<common::HistogramCuts>(gradient_index_->Cuts());
-  }
   xgbddpm_enabled_ = true;
-  gradient_index_.reset();
+  this->FinishXGBDDFastGHist(fast_gidx, hit_count_tloc);
 }
 
 void SimpleDMatrix::XGBDiffusionRefresh(ArrayInterface<2> const& x0,
@@ -176,6 +269,16 @@ void SimpleDMatrix::XGBDiffusionRefresh(ArrayInterface<2> const& x0,
   CHECK_EQ(this->Info().num_row_, out_rows);
   CHECK_EQ(this->Info().num_col_, out_cols);
 
+  if (gradient_index_) {
+    xgbddpm_cuts_ = std::make_shared<common::HistogramCuts>(gradient_index_->Cuts());
+  }
+  this->Info().num_nonzero_ = out_rows * out_cols;
+  auto fast_gidx = this->MakeXGBDDFastGHist();
+  std::vector<std::size_t> hit_count_tloc;
+  if (fast_gidx) {
+    hit_count_tloc.resize(fmat_ctx_.Threads() * fast_gidx->cut.TotalBins(), 0);
+  }
+
   auto& offset = sparse_page_->offset.HostVector();
   auto& data = sparse_page_->data.HostVector();
   offset.resize(out_rows + 1);
@@ -188,42 +291,75 @@ void SimpleDMatrix::XGBDiffusionRefresh(ArrayInterface<2> const& x0,
   auto& labels = this->Info().labels.Data()->HostVector();
   labels.resize(out_rows);
 
-  common::ParallelFor(out_rows, fmat_ctx_.Threads(), [&](auto out_r) {
-    auto t = all_steps ? out_r / rows_per_step : static_cast<std::size_t>(timestep);
-    auto step_r = all_steps ? out_r % rows_per_step : out_r;
-    auto base_r = step_r / static_cast<std::size_t>(noise_samples_per_row);
-    auto time = times(t);
-    auto alpha = std::sqrt(alpha_bars(t));
-    auto sigma = std::max(std::sqrt(1.0f - alpha_bars(t)), 1e-6f);
+  auto refresh = [&](auto bin_type, auto build_gidx) {
+    using BinT = decltype(bin_type);
+    constexpr bool kBuildGHist = decltype(build_gidx)::value;
+    BinT* index_data = nullptr;
+    std::uint32_t const* offsets = nullptr;
+    auto const* ptrs = static_cast<std::vector<std::uint32_t> const*>(nullptr);
+    auto const* values = static_cast<std::vector<float> const*>(nullptr);
+    if constexpr (kBuildGHist) {
+      index_data = fast_gidx->index.data<BinT>();
+      offsets = fast_gidx->index.Offset();
+      ptrs = &fast_gidx->cut.Ptrs();
+      values = &fast_gidx->cut.Values();
+    }
 
-    for (std::size_t c = 0; c < n_cols; ++c) {
-      auto out_i = out_r * out_cols + c;
-      auto z = XGBDDPMNormal(seed, out_r, c);
-      data[out_i].index = static_cast<bst_feature_t>(c);
-      data[out_i].fvalue = diffusion_type == 0
-                               ? alpha * x0(base_r, c) + sigma * z
-                               : (1.0f - time) * z + time * x0(base_r, c);
-      if (c == target_index) {
-        labels[out_r] = diffusion_type == 0 ? z : y0(base_r) - z;
+    common::ParallelFor(out_rows, fmat_ctx_.Threads(), [&](auto out_r) {
+      auto t = all_steps ? out_r / rows_per_step : static_cast<std::size_t>(timestep);
+      auto step_r = all_steps ? out_r % rows_per_step : out_r;
+      auto base_r = step_r / static_cast<std::size_t>(noise_samples_per_row);
+      auto time = times(t);
+      auto alpha = std::sqrt(alpha_bars(t));
+      auto sigma = std::max(std::sqrt(1.0f - alpha_bars(t)), 1e-6f);
+      auto tid = omp_get_thread_num();
+
+      for (std::size_t c = 0; c < n_cols; ++c) {
+        auto out_i = out_r * out_cols + c;
+        auto z = XGBDDPMNormal(seed, out_r, c);
+        auto fidx = static_cast<bst_feature_t>(c);
+        data[out_i].index = fidx;
+        data[out_i].fvalue = diffusion_type == 0
+                                 ? alpha * x0(base_r, c) + sigma * z
+                                 : (1.0f - time) * z + time * x0(base_r, c);
+        if constexpr (kBuildGHist) {
+          auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
+          index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
+          ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
+        }
+        if (c == target_index) {
+          labels[out_r] = diffusion_type == 0 ? z : y0(base_r) - z;
+        }
       }
-    }
 
-    if (all_steps) {
-      auto out_i = out_r * out_cols + n_cols;
-      data[out_i].index = static_cast<bst_feature_t>(n_cols);
-      data[out_i].fvalue = time;
-    }
-  });
+      if (all_steps) {
+        auto out_i = out_r * out_cols + n_cols;
+        auto fidx = static_cast<bst_feature_t>(n_cols);
+        data[out_i].index = fidx;
+        data[out_i].fvalue = time;
+        if constexpr (kBuildGHist) {
+          auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
+          index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
+          ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
+        }
+      }
+    });
+  };
+
+  if (fast_gidx) {
+    common::DispatchBinType(fast_gidx->index.GetBinTypeSize(), [&](auto bin_type) {
+      refresh(bin_type, std::true_type{});
+    });
+  } else {
+    refresh(std::uint32_t{}, std::false_type{});
+  }
 
   this->Info().num_nonzero_ = data.size();
   column_page_.reset();
   sorted_column_page_.reset();
   ellpack_page_.reset();
-  if (gradient_index_) {
-    xgbddpm_cuts_ = std::make_shared<common::HistogramCuts>(gradient_index_->Cuts());
-  }
   xgbddpm_enabled_ = true;
-  gradient_index_.reset();
+  this->FinishXGBDDFastGHist(fast_gidx, hit_count_tloc);
 }
 
 DMatrix* SimpleDMatrix::Slice(common::Span<int32_t const> ridxs) {

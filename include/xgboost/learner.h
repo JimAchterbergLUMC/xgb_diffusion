@@ -76,6 +76,10 @@ class Learner : public Model, public Configurable, public dmlc::Serializable {
    */
   virtual void ClearCaches() = 0;
   /*!
+   * \brief Clear the prediction cache for one data matrix.
+   */
+  virtual void ClearDMatrixCache(std::shared_ptr<DMatrix> data) = 0;
+  /*!
    * \brief update the model for one iteration
    *  With the specified objective function.
    * \param iter current iteration number
