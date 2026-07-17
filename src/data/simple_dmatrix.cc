@@ -188,7 +188,7 @@ void SimpleDMatrix::XGBDDPMRefresh(ArrayInterface<2> const& x0, ArrayInterface<1
               alpha * x0(base_r, c) + sigma * XGBDDPMNormal(seed, out_r, c);
         }
 
-        if constexpr (kBuildGHist) {
+        if (kBuildGHist) {
           auto fidx = static_cast<bst_feature_t>(c);
           auto bin_idx = is_cat ? fast_gidx->cut.SearchCatBin(data[out_i].fvalue, fidx, *ptrs,
                                                               *values)
@@ -208,7 +208,7 @@ void SimpleDMatrix::XGBDDPMRefresh(ArrayInterface<2> const& x0, ArrayInterface<1
         auto fidx = static_cast<bst_feature_t>(n_cols);
         data[out_i].index = fidx;
         data[out_i].fvalue = static_cast<bst_float>(t);
-        if constexpr (kBuildGHist) {
+        if (kBuildGHist) {
           auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
           index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
           ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
@@ -322,7 +322,7 @@ void SimpleDMatrix::XGBDiffusionRefresh(ArrayInterface<2> const& x0,
         data[out_i].fvalue = diffusion_type == 0
                                  ? alpha * x0(base_r, c) + sigma * z
                                  : (1.0f - time) * z + time * x0(base_r, c);
-        if constexpr (kBuildGHist) {
+        if (kBuildGHist) {
           auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
           index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
           ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
@@ -337,7 +337,7 @@ void SimpleDMatrix::XGBDiffusionRefresh(ArrayInterface<2> const& x0,
         auto fidx = static_cast<bst_feature_t>(n_cols);
         data[out_i].index = fidx;
         data[out_i].fvalue = time;
-        if constexpr (kBuildGHist) {
+        if (kBuildGHist) {
           auto bin_idx = fast_gidx->cut.SearchBin(data[out_i].fvalue, fidx, *ptrs, *values);
           index_data[out_i] = static_cast<BinT>(bin_idx - offsets[fidx]);
           ++hit_count_tloc[tid * fast_gidx->cut.TotalBins() + bin_idx];
